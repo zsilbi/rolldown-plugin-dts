@@ -1,10 +1,18 @@
-import { fork, spawn, type ChildProcess } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import path from 'node:path'
 import { createBirpc, type BirpcReturn } from 'birpc'
 import Debug from 'debug'
+import { fork, spawn, type ChildProcess } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import type { Plugin, SourceMapInput } from 'rolldown'
 import { isolatedDeclaration as oxcIsolatedDeclaration } from 'rolldown/experimental'
 import {
   filename_ts_to_dts,
@@ -18,7 +26,6 @@ import {
 import type { OptionsResolved } from './options.ts'
 import type { TscFunctions } from './utils/tsc-worker.ts'
 import type { TscOptions, TscResult } from './utils/tsc.ts'
-import type { Plugin, SourceMapInput } from 'rolldown'
 
 const debug = Debug('rolldown-plugin-dts:generate')
 
@@ -82,6 +89,7 @@ export function createGeneratePlugin({
   let rpc: BirpcReturn<TscFunctions> | undefined
   let tscEmit: (options: TscOptions) => TscResult
   let tsgoDist: string | undefined
+  let tsgoTmp: string | undefined
 
   if (!tsgo && parallel) {
     childProcess = fork(new URL(WORKER_URL, import.meta.url), {
@@ -107,20 +115,43 @@ export function createGeneratePlugin({
         const { default: getExePath } = await import(
           new URL('./lib/getExePath.js', tsgoPkg).href
         )
-        const tsgo = getExePath()
-        tsgoDist = await mkdtemp(path.join(tmpdir(), 'rolldown-plugin-dts-'))
+        const tsgoExe = getExePath()
+        tsgoTmp = await mkdtemp(path.join(tmpdir(), 'rolldown-plugin-dts-'))
+        tsgoDist = path.join(tsgoTmp, 'dist')
+        const tsgoSrc = path.join(tsgoTmp, 'src')
+        if (typeof tsgo !== 'string') {
+          tsgo = path.join(cwd, 'src')
+        }
+        await Promise.all([
+          symlink(tsgo, tsgoSrc),
+          symlink(
+            path.resolve(cwd, 'node_modules'),
+            path.join(tsgoTmp, 'node_modules'),
+          ),
+          symlink(
+            path.resolve(cwd, 'package.json'),
+            path.join(tsgoTmp, 'package.json'),
+          ),
+          writeFile(
+            path.join(tsgoTmp, 'tsconfig.json'),
+            JSON.stringify(tsconfigRaw),
+          ),
+          mkdir(tsgoDist, { recursive: true }),
+        ])
         await spawnAsync(
-          tsgo,
+          tsgoExe,
           [
             '--noEmit',
             'false',
+            '--noCheck',
             '--declaration',
             '--emitDeclarationOnly',
-            ...(tsconfig ? ['-p', tsconfig] : []),
+            '--rootDir',
+            tsgoSrc,
             '--outDir',
             tsgoDist,
           ],
-          { stdio: 'inherit' },
+          { stdio: 'inherit', cwd: tsgoTmp },
         )
       } else if (!parallel && (!isolatedDeclarations || vue)) {
         ;({ tscEmit } = await import('./utils/tsc.ts'))
@@ -295,9 +326,9 @@ export function createGeneratePlugin({
 
     async buildEnd() {
       childProcess?.kill()
-      if (tsgoDist) {
-        await rm(tsgoDist, { recursive: true, force: true }).catch(() => {})
-        tsgoDist = undefined
+      if (tsgoTmp) {
+        await rm(tsgoTmp, { recursive: true, force: true }).catch(() => {})
+        tsgoTmp = undefined
       }
     },
   }
